@@ -1,14 +1,12 @@
-use minifb::{Key, MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{Key, Window, WindowOptions};
 use rand::Rng;
+use rusqlite::Connection;
 use std::time::Instant;
 
 const BOARD_W: usize = 10;
 const BOARD_H: usize = 20;
-const CELL: usize = 24;
-const BOARD_X: usize = 360;
-const BOARD_Y: usize = 60;
-const WIN_W: usize = 800;
-const WIN_H: usize = 620;
+const DEFAULT_WIN_W: usize = 800;
+const DEFAULT_WIN_H: usize = 620;
 
 // NES color palette
 const NES_BG: u32 = 0x000000;        // Black background
@@ -48,6 +46,86 @@ const COLORS_LIGHT: [u32; 7] = [
     0x6888FC, // J - light blue
 ];
 
+struct Layout {
+    win_w: usize,
+    win_h: usize,
+    cell: usize,
+    board_x: usize,
+    board_y: usize,
+}
+
+impl Layout {
+    fn compute(win_w: usize, win_h: usize) -> Self {
+        // Cell size based on window height, leaving room for title and bottom margin
+        let cell = ((win_h - 80) / BOARD_H).max(8);
+        // Board horizontally: leave left side for cathedral (~45% of width), board, then right panel
+        let board_w_px = BOARD_W * cell;
+        let right_panel_w = 180;
+        // Center the board+panel in the right portion of the window
+        let left_area = (win_w * 45) / 100;
+        let right_area = win_w - left_area;
+        let total_game_w = board_w_px + 16 + right_panel_w;
+        let board_x = if right_area >= total_game_w {
+            left_area + (right_area - total_game_w) / 2
+        } else {
+            left_area
+        };
+        let board_h_px = BOARD_H * cell;
+        let board_y = (win_h - board_h_px) / 2;
+        Layout { win_w, win_h, cell, board_x, board_y }
+    }
+}
+
+struct HighScore {
+    score: u32,
+    _lines: u32,
+    level: u32,
+    _date: String,
+}
+
+fn db_path() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().unwrap_or_default();
+    p.pop();
+    p.push("tetris_scores.db");
+    p
+}
+
+fn init_db() -> Connection {
+    let conn = Connection::open(db_path()).expect("Failed to open score database");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS high_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            score INTEGER NOT NULL,
+            lines INTEGER NOT NULL,
+            level INTEGER NOT NULL,
+            date TEXT NOT NULL
+        )"
+    ).expect("Failed to create table");
+    conn
+}
+
+fn save_score(conn: &Connection, score: u32, lines: u32, level: u32) {
+    let date = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    conn.execute(
+        "INSERT INTO high_scores (score, lines, level, date) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![score, lines, level, date],
+    ).ok();
+}
+
+fn get_top_scores(conn: &Connection, limit: usize) -> Vec<HighScore> {
+    let mut stmt = conn.prepare(
+        "SELECT score, lines, level, date FROM high_scores ORDER BY score DESC LIMIT ?1"
+    ).unwrap();
+    stmt.query_map(rusqlite::params![limit], |row| {
+        Ok(HighScore {
+            score: row.get(0)?,
+            _lines: row.get(1)?,
+            level: row.get(2)?,
+            _date: row.get(3)?,
+        })
+    }).unwrap().filter_map(|r| r.ok()).collect()
+}
+
 struct Bag {
     pieces: Vec<usize>,
 }
@@ -75,9 +153,6 @@ impl Bag {
         self.pieces.remove(0)
     }
 
-    fn peek(&self) -> usize {
-        self.pieces[0]
-    }
 }
 
 struct Game {
@@ -87,6 +162,7 @@ struct Game {
     bag: Bag,
     score: u32, lines: u32, level: u32,
     game_over: bool,
+    score_saved: bool,
     auto_play: bool,
     ai_target: Option<(i32, usize)>,
     ai_timer: f64,
@@ -103,7 +179,7 @@ impl Game {
             piece: first, rot: 0, row: 0, col: 0,
             next,
             bag,
-            score: 0, lines: 0, level: 1, game_over: false,
+            score: 0, lines: 0, level: 1, game_over: false, score_saved: false,
             auto_play: false,
             ai_target: None,
             ai_timer: 0.0,
@@ -283,53 +359,34 @@ impl Game {
     }
 }
 
-fn set_pixel(buf: &mut [u32], x: usize, y: usize, c: u32) {
-    if x < WIN_W && y < WIN_H { buf[y * WIN_W + x] = c; }
+fn set_pixel(buf: &mut [u32], ww: usize, wh: usize, x: usize, y: usize, c: u32) {
+    if x < ww && y < wh { buf[y * ww + x] = c; }
 }
 
-fn fill_rect(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
-    for dy in 0..h { for dx in 0..w { set_pixel(buf, x+dx, y+dy, c); } }
+fn fill_rect(buf: &mut [u32], ww: usize, wh: usize, x: usize, y: usize, w: usize, h: usize, c: u32) {
+    for dy in 0..h { for dx in 0..w { set_pixel(buf, ww, wh, x+dx, y+dy, c); } }
 }
 
-fn draw_rect_outline(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
-    for dx in 0..w { set_pixel(buf, x+dx, y, c); set_pixel(buf, x+dx, y+h-1, c); }
-    for dy in 0..h { set_pixel(buf, x, y+dy, c); set_pixel(buf, x+w-1, y+dy, c); }
+fn draw_rect_outline(buf: &mut [u32], ww: usize, wh: usize, x: usize, y: usize, w: usize, h: usize, c: u32) {
+    for dx in 0..w { set_pixel(buf, ww, wh, x+dx, y, c); set_pixel(buf, ww, wh, x+dx, y+h-1, c); }
+    for dy in 0..h { set_pixel(buf, ww, wh, x, y+dy, c); set_pixel(buf, ww, wh, x+w-1, y+dy, c); }
 }
 
-fn draw_block(buf: &mut [u32], x: usize, y: usize, s: usize, c: u32) {
-    // NES-style 3D block
-    let light = blend(c, 0xFFFFFF, 100);
-    let dark = blend(c, 0x000000, 100);
-    // Fill
-    fill_rect(buf, x, y, s, s, c);
-    // Top and left highlight
-    fill_rect(buf, x, y, s, 2, light);
-    fill_rect(buf, x, y, 2, s, light);
-    // Bottom and right shadow
-    fill_rect(buf, x, y + s - 2, s, 2, dark);
-    fill_rect(buf, x + s - 2, y, 2, s, dark);
-    // Inner square accent
-    if s >= 10 {
-        fill_rect(buf, x + 4, y + 4, s - 8, s - 8, light);
-    }
-}
-
-fn draw_nes_block(buf: &mut [u32], x: usize, y: usize, s: usize, piece: usize) {
+fn draw_nes_block(buf: &mut [u32], ww: usize, wh: usize, x: usize, y: usize, s: usize, piece: usize) {
     let c = COLORS[piece];
     let cl = COLORS_LIGHT[piece];
     let dark = blend(c, 0x000000, 120);
-    // Fill with main color
-    fill_rect(buf, x, y, s, s, c);
-    // Top and left highlight (light color)
-    fill_rect(buf, x, y, s, 2, cl);
-    fill_rect(buf, x, y, 2, s, cl);
-    // Bottom and right shadow
-    fill_rect(buf, x, y + s - 2, s, 2, dark);
-    fill_rect(buf, x + s - 2, y, 2, s, dark);
-    // Inner shine
+    let b = (s / 12).max(1); // border thickness scales with cell size
+    fill_rect(buf, ww, wh, x, y, s, s, c);
+    fill_rect(buf, ww, wh, x, y, s, b, cl);
+    fill_rect(buf, ww, wh, x, y, b, s, cl);
+    fill_rect(buf, ww, wh, x, y + s - b, s, b, dark);
+    fill_rect(buf, ww, wh, x + s - b, y, b, s, dark);
     if s >= 12 {
-        fill_rect(buf, x + 5, y + 5, s - 10, s - 10, cl);
-        fill_rect(buf, x + 7, y + 7, s - 14, s - 14, c);
+        let i = s / 5;
+        let j = s / 4;
+        fill_rect(buf, ww, wh, x + i, y + i, s - i*2, s - i*2, cl);
+        fill_rect(buf, ww, wh, x + j, y + j, s - j*2, s - j*2, c);
     }
 }
 
@@ -391,61 +448,69 @@ const FONT: &[(char, [u8; 7])] = &[
     ('.', [0b00000,0b00000,0b00000,0b00000,0b00000,0b00000,0b00100]),
 ];
 
-fn draw_char(buf: &mut [u32], ch: char, x: usize, y: usize, scale: usize, color: u32) {
+fn draw_char(buf: &mut [u32], ww: usize, wh: usize, ch: char, x: usize, y: usize, scale: usize, color: u32) {
     let upper = ch.to_ascii_uppercase();
     let glyph = FONT.iter().find(|(c, _)| *c == upper).map(|(_, g)| g);
     if let Some(g) = glyph {
         for (row, &bits) in g.iter().enumerate() {
             for col in 0..5 {
                 if bits & (1 << (4 - col)) != 0 {
-                    fill_rect(buf, x + col * scale, y + row * scale, scale, scale, color);
+                    fill_rect(buf, ww, wh, x + col * scale, y + row * scale, scale, scale, color);
                 }
             }
         }
     }
 }
 
-fn draw_text(buf: &mut [u32], text: &str, x: usize, y: usize, scale: usize, color: u32) {
+fn draw_text(buf: &mut [u32], ww: usize, wh: usize, text: &str, x: usize, y: usize, scale: usize, color: u32) {
     for (i, ch) in text.chars().enumerate() {
-        draw_char(buf, ch, x + i * 6 * scale, y, scale, color);
+        draw_char(buf, ww, wh, ch, x + i * 6 * scale, y, scale, color);
     }
 }
 
-fn draw_button(buf: &mut [u32], x: usize, y: usize, w: usize, h: usize, label: &str, hover: bool) {
-    let bg = if hover { 0x0058F8 } else { NES_PANEL_BG };
-    fill_rect(buf, x, y, w, h, bg);
-    draw_rect_outline(buf, x, y, w, h, NES_BORDER);
-    let tw = label.len() * 12;
-    let tx = x + (w.saturating_sub(tw)) / 2;
-    let ty = y + (h.saturating_sub(14)) / 2;
-    draw_text(buf, label, tx, ty, 2, NES_TEXT);
-}
-
 fn main() {
-    let mut window = Window::new("Tetris", WIN_W, WIN_H, WindowOptions::default())
-        .expect("Failed to create window");
+    let mut window = Window::new("Tetris", DEFAULT_WIN_W, DEFAULT_WIN_H, WindowOptions {
+        resize: true,
+        ..WindowOptions::default()
+    }).expect("Failed to create window");
     window.set_target_fps(60);
 
-    let mut buf = vec![0u32; WIN_W * WIN_H];
+    let db = init_db();
+    let mut win_w = DEFAULT_WIN_W;
+    let mut win_h = DEFAULT_WIN_H;
+    let mut buf = vec![0u32; win_w * win_h];
     let mut game = Game::new();
+    let mut cached_high_scores: Vec<HighScore> = get_top_scores(&db, 5);
     let mut last_drop = Instant::now();
     let mut prev_keys: Vec<Key> = vec![];
     let mut frame: u64 = 0;
-    // Generate random star positions
+    // Generate random star positions (normalized 0.0..1.0)
     let mut rng = rand::thread_rng();
-    let stars: Vec<(usize, usize, u32)> = (0..40).map(|_| {
-        (rng.gen_range(0..WIN_W), rng.gen_range(0..WIN_H / 2 + 100), rng.gen_range(0..360))
+    let stars: Vec<(f64, f64, u32)> = (0..40).map(|_| {
+        (rng.r#gen::<f64>(), rng.r#gen::<f64>() * 0.7, rng.gen_range(0..360))
     }).collect();
 
     loop {
         if !window.is_open() || window.is_key_down(Key::Escape) { break; }
 
+        // Handle resize
+        let (new_w, new_h) = window.get_size();
+        let new_w = new_w.max(400);
+        let new_h = new_h.max(300);
+        if new_w != win_w || new_h != win_h {
+            win_w = new_w;
+            win_h = new_h;
+            buf.resize(win_w * win_h, 0);
+        }
+        let lay = Layout::compute(win_w, win_h);
+        let ww = lay.win_w;
+        let wh = lay.win_h;
+        let cell = lay.cell;
+        let board_x = lay.board_x;
+        let board_y = lay.board_y;
+
         let keys = window.get_keys();
         let newly_pressed: Vec<Key> = keys.iter().filter(|k| !prev_keys.contains(k)).copied().collect();
-
-        // Mouse
-        let mouse_pos = window.get_mouse_pos(MouseMode::Clamp);
-        let mouse_down = window.get_mouse_down(MouseButton::Left);
 
         // Toggle auto-play
         for &k in &newly_pressed {
@@ -454,12 +519,11 @@ fn main() {
 
         if !game.game_over {
             if game.auto_play {
-                // AI auto-play
                 if game.ai_target.is_none() {
                     game.ai_target = Some(game.ai_find_best());
                 }
                 game.ai_timer += 1.0 / 60.0;
-                let ai_speed = 0.005; // seconds per AI move
+                let ai_speed = 0.005;
                 if game.ai_timer >= ai_speed {
                     game.ai_timer = 0.0;
                     if let Some((target_col, target_rot)) = game.ai_target {
@@ -498,449 +562,391 @@ fn main() {
                 last_drop = Instant::now();
             }
         } else {
+            if !game.score_saved {
+                save_score(&db, game.score, game.lines, game.level);
+                cached_high_scores = get_top_scores(&db, 5);
+                game.score_saved = true;
+            }
             for &k in &newly_pressed {
                 if k == Key::R { game = Game::new(); last_drop = Instant::now(); }
             }
         }
 
-        //
-
-        // === DRAW (NES STYLE) ===
+        // === DRAW ===
         buf.fill(NES_BG);
         frame += 1;
 
-        // --- Background: Night sky with twinkling stars ---
-        for (i, &(sx, sy, phase)) in stars.iter().enumerate() {
+        // Stars (normalized positions)
+        for (i, &(sx_f, sy_f, phase)) in stars.iter().enumerate() {
+            let sx = (sx_f * ww as f64) as usize;
+            let sy = (sy_f * wh as f64) as usize;
             let t = ((frame as f64 / 30.0) + phase as f64 / 60.0).sin();
             let brightness = ((t * 0.5 + 0.5) * 255.0) as u32;
             let star_c = (brightness << 16) | (brightness << 8) | brightness;
-            set_pixel(&mut buf, sx, sy, star_c);
-            // Some stars are bigger
+            set_pixel(&mut buf, ww, wh, sx, sy, star_c);
             if i % 3 == 0 {
-                set_pixel(&mut buf, sx + 1, sy, star_c);
-                set_pixel(&mut buf, sx, sy + 1, star_c);
+                set_pixel(&mut buf, ww, wh, sx + 1, sy, star_c);
+                set_pixel(&mut buf, ww, wh, sx, sy + 1, star_c);
             }
         }
 
-        // --- St. Basil's Cathedral (detailed pixel art) ---
-        let ground_y = WIN_H - 35;
-        let cat_x = 170i32; // Left side, visible area
+        // Cathedral background - scale based on window height
+        let ground_y = wh - (wh / 18);
+        let scale_f = wh as f64 / DEFAULT_WIN_H as f64;
+        let cat_x = ((ww as f64) * 0.22) as i32;
 
-        // Night sky gradient near horizon
-        for y in (ground_y.saturating_sub(120))..ground_y {
-            let t = (y as i32 - (ground_y as i32 - 120)).max(0) as u32;
-            let r = t / 8;
-            let g = t / 6;
-            let b = (t / 3).min(40);
+        // Horizon gradient
+        let grad_h = (120.0 * scale_f) as usize;
+        for y in (ground_y.saturating_sub(grad_h))..ground_y {
+            let t = (y as i32 - (ground_y as i32 - grad_h as i32)).max(0) as u32;
+            let r = t / 8; let g = t / 6; let b = (t / 3).min(40);
             let c = (r << 16) | (g << 8) | b;
-            for x in 0..WIN_W { set_pixel(&mut buf, x, y, c); }
+            for x in 0..ww { set_pixel(&mut buf, ww, wh, x, y, c); }
         }
 
-        // Ground - Red Square cobblestone
-        fill_rect(&mut buf, 0, ground_y, WIN_W, WIN_H - ground_y, 0x1A1008);
-        // Cobblestone texture
+        // Ground
+        fill_rect(&mut buf, ww, wh, 0, ground_y, ww, wh - ground_y, 0x1A1008);
         for i in 0..30 {
-            let cx = (i * 23 + 7) % WIN_W;
-            let cy = ground_y + (i * 7 + 3) % (WIN_H - ground_y);
-            fill_rect(&mut buf, cx, cy, 8, 3, 0x221810);
+            let cx = (i * 23 + 7) % ww;
+            let cy = ground_y + (i * 7 + 3) % (wh - ground_y).max(1);
+            fill_rect(&mut buf, ww, wh, cx, cy, 8, 3, 0x221810);
         }
-        // Ground line
-        fill_rect(&mut buf, 0, ground_y, WIN_W, 2, 0x383028);
+        fill_rect(&mut buf, ww, wh, 0, ground_y, ww, 2, 0x383028);
 
-        // === Helper: draw striped onion dome ===
+        // Helper: draw striped onion dome (scaled)
         let draw_onion = |buf: &mut [u32], cx: i32, base_y: i32, w: i32, h: i32,
                           c1: u32, c2: u32, stripe_w: i32, gold_tip: bool| {
-            // Gold cross on top
             let cross_c = 0xD8B800;
-            let tip_y = base_y - h - 18;
-            fill_rect(buf, (cx - 1) as usize, tip_y as usize, 2, 14, cross_c);
-            fill_rect(buf, (cx - 4) as usize, (tip_y + 4) as usize, 8, 2, cross_c);
-            // Gold ball at tip
+            let tip_y = base_y - h - (18.0 * scale_f) as i32;
+            fill_rect(buf, ww, wh, (cx - 1) as usize, tip_y as usize, 2, (14.0 * scale_f) as usize, cross_c);
+            fill_rect(buf, ww, wh, (cx - 4) as usize, (tip_y + (4.0 * scale_f) as i32) as usize, 8, 2, cross_c);
             if gold_tip {
-                fill_rect(buf, (cx - 2) as usize, (tip_y - 3) as usize, 5, 5, cross_c);
-                fill_rect(buf, (cx - 1) as usize, (tip_y - 4) as usize, 3, 7, cross_c);
+                fill_rect(buf, ww, wh, (cx - 2) as usize, (tip_y - 3) as usize, 5, 5, cross_c);
+                fill_rect(buf, ww, wh, (cx - 1) as usize, (tip_y - 4) as usize, 3, 7, cross_c);
             }
-
-            // Onion dome shape - draw row by row for smooth curve
             for dy in 0..h {
-                let t = dy as f64 / h as f64; // 0 at top, 1 at bottom
-                // Onion curve: narrow tip, bulge out, narrow at base
+                let t = dy as f64 / h as f64;
                 let width = if t < 0.15 {
-                    // Narrow tip
                     (t / 0.15 * w as f64 * 0.2) as i32
                 } else if t < 0.5 {
-                    // Expanding bulge
                     let bt = (t - 0.15) / 0.35;
                     (w as f64 * (0.2 + bt * 0.8)) as i32
-                } else if t < 0.8 {
-                    // Maximum width
-                    w
-                } else {
-                    // Taper at bottom
+                } else if t < 0.8 { w } else {
                     let bt = (t - 0.8) / 0.2;
                     (w as f64 * (1.0 - bt * 0.3)) as i32
                 };
-
                 let y = (base_y - h + dy) as usize;
                 let x_start = cx - width / 2;
                 for dx in 0..width {
                     let x = (x_start + dx) as usize;
-                    // Striped pattern
-                    let stripe = if stripe_w > 0 {
-                        // Vertical spiral stripes (shift with row for spiral effect)
-                        ((dx + dy / 3) / stripe_w) % 2 == 0
-                    } else {
-                        // Horizontal stripes
-                        (dy / 3) % 2 == 0
-                    };
+                    let stripe = if stripe_w > 0 { ((dx + dy / 3) / stripe_w) % 2 == 0 } else { (dy / 3) % 2 == 0 };
                     let color = if stripe { c1 } else { c2 };
-                    if x < WIN_W && y < WIN_H {
-                        set_pixel(buf, x, y, color);
-                    }
+                    if x < ww && y < wh { set_pixel(buf, ww, wh, x, y, color); }
                 }
             }
         };
 
-        // Brick color palette
-        let brick = 0xB85838;      // Main brick
-        let brick_dark = 0x883828; // Dark brick
-        let brick_lite = 0xD07050; // Light brick
-        let white_trim = 0xE8E0D0; // White/cream trim
-        let green_roof = 0x286828; // Green roof
+        // Scaled cathedral drawing
+        let s = scale_f;
+        let brick = 0xB85838; let brick_dark = 0x883828; let brick_lite = 0xD07050;
+        let white_trim = 0xE8E0D0; let green_roof = 0x286828;
+        let ct_x = cat_x; let ct_base = ground_y as i32;
+        let si = |v: i32| (v as f64 * s) as i32;
+        let su = |v: usize| (v as f64 * s) as usize;
 
-        // === MAIN CENTRAL TOWER (tallest) ===
-        // Multi-tiered tower body
-        let ct_x = cat_x;
-        let ct_base = ground_y as i32;
-
-        // Base tier (wide)
-        fill_rect(&mut buf, (ct_x - 35) as usize, (ct_base - 60) as usize, 70, 60, brick);
-        // White trim bands
-        fill_rect(&mut buf, (ct_x - 36) as usize, (ct_base - 60) as usize, 72, 3, white_trim);
-        fill_rect(&mut buf, (ct_x - 36) as usize, (ct_base - 30) as usize, 72, 2, white_trim);
-        // Windows on base
+        // Main tower
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-35)) as usize, (ct_base + si(-60)) as usize, su(70), su(60), brick);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-36)) as usize, (ct_base + si(-60)) as usize, su(72), su(3), white_trim);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-36)) as usize, (ct_base + si(-30)) as usize, su(72), su(2), white_trim);
         for wx in [-20i32, -5, 10] {
-            fill_rect(&mut buf, (ct_x + wx) as usize, (ct_base - 52) as usize, 8, 16, 0x181008);
-            // Arch top
-            fill_rect(&mut buf, (ct_x + wx + 1) as usize, (ct_base - 54) as usize, 6, 2, brick_lite);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(wx)) as usize, (ct_base + si(-52)) as usize, su(8), su(16), 0x181008);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(wx + 1)) as usize, (ct_base + si(-54)) as usize, su(6), su(2), brick_lite);
         }
-
-        // Second tier (narrower, octagonal look)
-        fill_rect(&mut buf, (ct_x - 22) as usize, (ct_base - 110) as usize, 44, 50, brick_lite);
-        fill_rect(&mut buf, (ct_x - 24) as usize, (ct_base - 110) as usize, 48, 3, white_trim);
-        fill_rect(&mut buf, (ct_x - 24) as usize, (ct_base - 80) as usize, 48, 2, white_trim);
-        // Kokoshnik arches (decorative)
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-22)) as usize, (ct_base + si(-110)) as usize, su(44), su(50), brick_lite);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-24)) as usize, (ct_base + si(-110)) as usize, su(48), su(3), white_trim);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-24)) as usize, (ct_base + si(-80)) as usize, su(48), su(2), white_trim);
         for kx in [-16i32, -4, 8] {
-            fill_rect(&mut buf, (ct_x + kx) as usize, (ct_base - 106) as usize, 10, 2, 0xD8B800);
-            fill_rect(&mut buf, (ct_x + kx + 2) as usize, (ct_base - 108) as usize, 6, 2, 0xD8B800);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(kx)) as usize, (ct_base + si(-106)) as usize, su(10), su(2), 0xD8B800);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(kx + 2)) as usize, (ct_base + si(-108)) as usize, su(6), su(2), 0xD8B800);
         }
-        // Windows
         for wx in [-14i32, 4] {
-            fill_rect(&mut buf, (ct_x + wx) as usize, (ct_base - 100) as usize, 6, 12, 0x181008);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(wx)) as usize, (ct_base + si(-100)) as usize, su(6), su(12), 0x181008);
         }
-
-        // Third tier (spire section)
-        fill_rect(&mut buf, (ct_x - 14) as usize, (ct_base - 155) as usize, 28, 45, brick);
-        fill_rect(&mut buf, (ct_x - 16) as usize, (ct_base - 155) as usize, 32, 2, white_trim);
-        // Zigzag decoration
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-14)) as usize, (ct_base + si(-155)) as usize, su(28), su(45), brick);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-16)) as usize, (ct_base + si(-155)) as usize, su(32), su(2), white_trim);
         for i in 0..8 {
-            let zx = ct_x - 12 + i * 3;
-            fill_rect(&mut buf, zx as usize, (ct_base - 150) as usize, 2, 2, 0xD8B800);
-            fill_rect(&mut buf, (zx + 1) as usize, (ct_base - 148) as usize, 2, 2, 0xD8B800);
+            let zx = ct_x + si(-12 + i * 3);
+            fill_rect(&mut buf, ww, wh, zx as usize, (ct_base + si(-150)) as usize, su(2), su(2), 0xD8B800);
+            fill_rect(&mut buf, ww, wh, (zx + si(1)) as usize, (ct_base + si(-148)) as usize, su(2), su(2), 0xD8B800);
         }
-
-        // Pointed spire top
-        for dy in 0..30 {
-            let w = (30 - dy) * 14 / 30;
-            fill_rect(&mut buf, (ct_x - w / 2) as usize, (ct_base - 185 + dy) as usize,
-                      w as usize, 1, brick_lite);
-            // Red and white alternating pattern
+        for dy in 0..su(30) {
+            let w = ((su(30) - dy) * su(14)) / su(30).max(1);
+            let yp = ct_base + si(-185) + dy as i32;
+            fill_rect(&mut buf, ww, wh, (ct_x - w as i32 / 2) as usize, yp as usize, w, 1, brick_lite);
             if dy % 4 < 2 {
-                fill_rect(&mut buf, (ct_x - w / 2) as usize, (ct_base - 185 + dy) as usize,
-                          w as usize, 1, 0xD07050);
+                fill_rect(&mut buf, ww, wh, (ct_x - w as i32 / 2) as usize, yp as usize, w, 1, 0xD07050);
             }
         }
+        draw_onion(&mut buf, ct_x, ct_base + si(-185), si(14), si(20), 0xD8B800, 0xC0A000, 0, true);
 
-        // GOLD dome on top of central spire
-        draw_onion(&mut buf, ct_x, ct_base - 185, 14, 20, 0xD8B800, 0xC0A000, 0, true);
+        // Left domes
+        let ld1_x = ct_x + si(-60);
+        fill_rect(&mut buf, ww, wh, (ld1_x + si(-16)) as usize, (ct_base + si(-75)) as usize, su(32), su(75), brick_dark);
+        fill_rect(&mut buf, ww, wh, (ld1_x + si(-18)) as usize, (ct_base + si(-75)) as usize, su(36), su(3), white_trim);
+        for wx in [-8i32, 4] { fill_rect(&mut buf, ww, wh, (ld1_x + si(wx)) as usize, (ct_base + si(-65)) as usize, su(6), su(10), 0x181008); }
+        draw_onion(&mut buf, ld1_x, ct_base + si(-75), si(26), si(36), 0x286828, 0xC8B020, (4.0 * s) as i32, true);
 
-        // === LEFT DOME 1 - Green & Gold striped (large) ===
-        let ld1_x = ct_x - 60;
-        fill_rect(&mut buf, (ld1_x - 16) as usize, (ct_base - 75) as usize, 32, 75, brick_dark);
-        fill_rect(&mut buf, (ld1_x - 18) as usize, (ct_base - 75) as usize, 36, 3, white_trim);
-        // Arched windows
-        for wx in [-8i32, 4] {
-            fill_rect(&mut buf, (ld1_x + wx) as usize, (ct_base - 65) as usize, 6, 10, 0x181008);
-        }
-        draw_onion(&mut buf, ld1_x, ct_base - 75, 26, 36, 0x286828, 0xC8B020, 4, true);
+        let ld2_x = ct_x + si(-25);
+        fill_rect(&mut buf, ww, wh, (ld2_x + si(-14)) as usize, (ct_base + si(-90)) as usize, su(28), su(90), brick);
+        fill_rect(&mut buf, ww, wh, (ld2_x + si(-16)) as usize, (ct_base + si(-90)) as usize, su(32), su(2), white_trim);
+        fill_rect(&mut buf, ww, wh, (ld2_x + si(-16)) as usize, (ct_base + si(-60)) as usize, su(32), su(2), white_trim);
+        for wx in [-8i32, 2] { fill_rect(&mut buf, ww, wh, (ld2_x + si(wx)) as usize, (ct_base + si(-82)) as usize, su(6), su(12), 0x181008); }
+        draw_onion(&mut buf, ld2_x, ct_base + si(-90), si(22), si(30), 0x2050C8, 0xE8E8F0, (3.0 * s) as i32, true);
 
-        // === LEFT DOME 2 - Blue & White striped ===
-        let ld2_x = ct_x - 25;
-        fill_rect(&mut buf, (ld2_x - 14) as usize, (ct_base - 90) as usize, 28, 90, brick);
-        fill_rect(&mut buf, (ld2_x - 16) as usize, (ct_base - 90) as usize, 32, 2, white_trim);
-        fill_rect(&mut buf, (ld2_x - 16) as usize, (ct_base - 60) as usize, 32, 2, white_trim);
-        for wx in [-8i32, 2] {
-            fill_rect(&mut buf, (ld2_x + wx) as usize, (ct_base - 82) as usize, 6, 12, 0x181008);
-        }
-        draw_onion(&mut buf, ld2_x, ct_base - 90, 22, 30, 0x2050C8, 0xE8E8F0, 3, true);
+        // Right domes
+        let rd1_x = ct_x + si(55);
+        fill_rect(&mut buf, ww, wh, (rd1_x + si(-16)) as usize, (ct_base + si(-80)) as usize, su(32), su(80), brick);
+        fill_rect(&mut buf, ww, wh, (rd1_x + si(-18)) as usize, (ct_base + si(-80)) as usize, su(36), su(3), white_trim);
+        for wx in [-8i32, 4] { fill_rect(&mut buf, ww, wh, (rd1_x + si(wx)) as usize, (ct_base + si(-70)) as usize, su(6), su(10), 0x181008); }
+        draw_onion(&mut buf, rd1_x, ct_base + si(-80), si(24), si(32), 0xC82020, 0x206828, (3.0 * s) as i32, true);
 
-        // === RIGHT DOME 1 - Red & Green checkered ===
-        let rd1_x = ct_x + 55;
-        fill_rect(&mut buf, (rd1_x - 16) as usize, (ct_base - 80) as usize, 32, 80, brick);
-        fill_rect(&mut buf, (rd1_x - 18) as usize, (ct_base - 80) as usize, 36, 3, white_trim);
-        for wx in [-8i32, 4] {
-            fill_rect(&mut buf, (rd1_x + wx) as usize, (ct_base - 70) as usize, 6, 10, 0x181008);
-        }
-        draw_onion(&mut buf, rd1_x, ct_base - 80, 24, 32, 0xC82020, 0x206828, 3, true);
+        let rd2_x = ct_x + si(28);
+        fill_rect(&mut buf, ww, wh, (rd2_x + si(-12)) as usize, (ct_base + si(-85)) as usize, su(24), su(85), brick_lite);
+        fill_rect(&mut buf, ww, wh, (rd2_x + si(-14)) as usize, (ct_base + si(-85)) as usize, su(28), su(2), white_trim);
+        for wx in [-6i32, 2] { fill_rect(&mut buf, ww, wh, (rd2_x + si(wx)) as usize, (ct_base + si(-78)) as usize, su(5), su(10), 0x181008); }
+        draw_onion(&mut buf, rd2_x, ct_base + si(-85), si(18), si(24), 0xC8A020, 0x388830, (3.0 * s) as i32, true);
 
-        // === RIGHT DOME 2 - Gold/Yellow patterned ===
-        let rd2_x = ct_x + 28;
-        fill_rect(&mut buf, (rd2_x - 12) as usize, (ct_base - 85) as usize, 24, 85, brick_lite);
-        fill_rect(&mut buf, (rd2_x - 14) as usize, (ct_base - 85) as usize, 28, 2, white_trim);
-        for wx in [-6i32, 2] {
-            fill_rect(&mut buf, (rd2_x + wx) as usize, (ct_base - 78) as usize, 5, 10, 0x181008);
-        }
-        draw_onion(&mut buf, rd2_x, ct_base - 85, 18, 24, 0xC8A020, 0x388830, 3, true);
-
-        // === FAR LEFT small dark tower ===
-        let fl_x = ct_x - 90;
-        fill_rect(&mut buf, (fl_x - 10) as usize, (ct_base - 55) as usize, 20, 55, brick_dark);
-        fill_rect(&mut buf, (fl_x - 12) as usize, (ct_base - 55) as usize, 24, 2, white_trim);
-        // Small pointed roof
-        for dy in 0..20 {
-            let w = (20 - dy) * 12 / 20;
+        // Far towers
+        let fl_x = ct_x + si(-90);
+        fill_rect(&mut buf, ww, wh, (fl_x + si(-10)) as usize, (ct_base + si(-55)) as usize, su(20), su(55), brick_dark);
+        fill_rect(&mut buf, ww, wh, (fl_x + si(-12)) as usize, (ct_base + si(-55)) as usize, su(24), su(2), white_trim);
+        for dy in 0..su(20) {
+            let w = ((su(20) - dy) * su(12)) / su(20).max(1);
             let c = if dy % 3 == 0 { 0x183018 } else { 0x284828 };
-            fill_rect(&mut buf, (fl_x - w / 2) as usize, (ct_base - 75 + dy) as usize, w as usize, 1, c);
+            fill_rect(&mut buf, ww, wh, (fl_x - w as i32 / 2) as usize, (ct_base + si(-75) + dy as i32) as usize, w, 1, c);
         }
-        // Tiny dome
-        draw_onion(&mut buf, fl_x, ct_base - 75, 10, 14, 0x2030A0, 0x602060, 2, true);
+        draw_onion(&mut buf, fl_x, ct_base + si(-75), si(10), si(14), 0x2030A0, 0x602060, (2.0 * s) as i32, true);
 
-        // === FAR RIGHT small tower ===
-        let fr_x = ct_x + 82;
-        fill_rect(&mut buf, (fr_x - 10) as usize, (ct_base - 50) as usize, 20, 50, brick_dark);
-        fill_rect(&mut buf, (fr_x - 12) as usize, (ct_base - 50) as usize, 24, 2, white_trim);
-        // Green roof
-        for dy in 0..15 {
-            let w = (15 - dy) * 14 / 15;
-            fill_rect(&mut buf, (fr_x - w / 2) as usize, (ct_base - 65 + dy) as usize, w as usize, 1, green_roof);
+        let fr_x = ct_x + si(82);
+        fill_rect(&mut buf, ww, wh, (fr_x + si(-10)) as usize, (ct_base + si(-50)) as usize, su(20), su(50), brick_dark);
+        fill_rect(&mut buf, ww, wh, (fr_x + si(-12)) as usize, (ct_base + si(-50)) as usize, su(24), su(2), white_trim);
+        for dy in 0..su(15) {
+            let w = ((su(15) - dy) * su(14)) / su(15).max(1);
+            fill_rect(&mut buf, ww, wh, (fr_x - w as i32 / 2) as usize, (ct_base + si(-65) + dy as i32) as usize, w, 1, green_roof);
         }
 
-        // === Base wall connecting everything ===
-        fill_rect(&mut buf, (ct_x - 95) as usize, (ct_base - 18) as usize, 190, 18, brick);
-        fill_rect(&mut buf, (ct_x - 96) as usize, (ct_base - 18) as usize, 192, 2, white_trim);
-        fill_rect(&mut buf, (ct_x - 96) as usize, (ct_base - 1) as usize, 192, 2, white_trim);
-        // Archways in base wall
+        // Base wall
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-95)) as usize, (ct_base + si(-18)) as usize, su(190), su(18), brick);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-96)) as usize, (ct_base + si(-18)) as usize, su(192), su(2), white_trim);
+        fill_rect(&mut buf, ww, wh, (ct_x + si(-96)) as usize, (ct_base - 1) as usize, su(192), su(2), white_trim);
         for ax in [-60i32, -20, 20, 50] {
-            fill_rect(&mut buf, (ct_x + ax) as usize, (ct_base - 16) as usize, 14, 16, 0x100808);
-            fill_rect(&mut buf, (ct_x + ax + 1) as usize, (ct_base - 18) as usize, 12, 2, brick_lite);
-            fill_rect(&mut buf, (ct_x + ax + 2) as usize, (ct_base - 20) as usize, 10, 2, brick_lite);
-            fill_rect(&mut buf, (ct_x + ax + 3) as usize, (ct_base - 22) as usize, 8, 2, brick_lite);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(ax)) as usize, (ct_base + si(-16)) as usize, su(14), su(16), 0x100808);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(ax + 1)) as usize, (ct_base + si(-18)) as usize, su(12), su(2), brick_lite);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(ax + 2)) as usize, (ct_base + si(-20)) as usize, su(10), su(2), brick_lite);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(ax + 3)) as usize, (ct_base + si(-22)) as usize, su(8), su(2), brick_lite);
         }
 
-        // Animated window glow
+        // Window glow
         for wx in [-60i32, -25, 28, 55] {
-            let glow = (((frame as f64 / 40.0) + wx as f64 / 10.0).sin() * 0.3 + 0.7);
+            let glow = ((frame as f64 / 40.0) + wx as f64 / 10.0).sin() * 0.3 + 0.7;
             let gi = (glow * 60.0) as u32;
             let gc = (gi << 16) | ((gi * 9 / 10) << 8) | (gi / 3);
-            fill_rect(&mut buf, (ct_x + wx + 3) as usize, (ct_base - 12) as usize, 8, 8, gc);
+            fill_rect(&mut buf, ww, wh, (ct_x + si(wx + 3)) as usize, (ct_base + si(-12)) as usize, su(8), su(8), gc);
         }
 
-        // Snowflakes animation - heavy snowfall
+        // Snowflakes
         for i in 0..80 {
-            // Each snowflake has unique speed, drift and size
-            let speed = 0.4 + (i as f64 * 0.618).fract() * 0.8; // varied fall speed
-            let drift = ((frame as f64 * 0.02 + i as f64 * 1.7).sin()) * 30.0; // horizontal sway
-            let sx = ((i as f64 * 51.7 + drift) % WIN_W as f64 + WIN_W as f64) as usize % WIN_W;
+            let speed = 0.4 + (i as f64 * 0.618).fract() * 0.8;
+            let drift = ((frame as f64 * 0.02 + i as f64 * 1.7).sin()) * 30.0 * s;
+            let sx = ((i as f64 * 51.7 * s + drift) % ww as f64 + ww as f64) as usize % ww;
             let sy = ((frame as f64 * speed + i as f64 * 41.3) % (ground_y as f64 + 20.0)) as usize;
             let brightness = (((frame as f64 / 25.0 + i as f64).sin() * 0.2 + 0.8) * 255.0) as u32;
             let sc = (brightness << 16) | (brightness << 8) | brightness;
-            if sy < WIN_H {
-                set_pixel(&mut buf, sx, sy, sc);
-                // Larger flakes for some
-                if i % 3 == 0 && sx + 1 < WIN_W {
-                    set_pixel(&mut buf, sx + 1, sy, sc);
-                    if sy + 1 < WIN_H { set_pixel(&mut buf, sx, sy + 1, sc); }
+            if sy < wh {
+                set_pixel(&mut buf, ww, wh, sx, sy, sc);
+                if i % 3 == 0 && sx + 1 < ww {
+                    set_pixel(&mut buf, ww, wh, sx + 1, sy, sc);
+                    if sy + 1 < wh { set_pixel(&mut buf, ww, wh, sx, sy + 1, sc); }
                 }
-                // Even bigger flakes
-                if i % 7 == 0 && sx + 2 < WIN_W && sy + 2 < WIN_H {
-                    set_pixel(&mut buf, sx + 1, sy + 1, sc);
-                    set_pixel(&mut buf, sx + 2, sy, sc);
-                    set_pixel(&mut buf, sx, sy + 2, sc);
+                if i % 7 == 0 && sx + 2 < ww && sy + 2 < wh {
+                    set_pixel(&mut buf, ww, wh, sx + 1, sy + 1, sc);
+                    set_pixel(&mut buf, ww, wh, sx + 2, sy, sc);
+                    set_pixel(&mut buf, ww, wh, sx, sy + 2, sc);
                 }
             }
         }
-        // Snow accumulation on ground
-        for i in 0..WIN_W {
+        // Snow accumulation
+        for i in 0..ww {
             let h = (((i as f64 * 0.05).sin() * 2.0 + 3.0) as usize).min(6);
-            fill_rect(&mut buf, i, ground_y.saturating_sub(h), 1, h, 0xD0D8E0);
+            fill_rect(&mut buf, ww, wh, i, ground_y.saturating_sub(h), 1, h, 0xD0D8E0);
         }
 
-        // Title area - with decorative Russian-style borders
-        let title_x = BOARD_X + BOARD_W * CELL / 2 - 72;
-        let title_y = 10;
-        // Ornamental border around title
-        fill_rect(&mut buf, title_x - 15, title_y - 4, 180, 34, 0x0000A8);
-        draw_rect_outline(&mut buf, title_x - 15, title_y - 4, 180, 34, 0xD8B800);
-        draw_rect_outline(&mut buf, title_x - 13, title_y - 2, 176, 30, 0xA81010);
-        // Star decorations on title corners
-        fill_rect(&mut buf, title_x - 18, title_y - 1, 6, 6, 0xD8B800);
-        fill_rect(&mut buf, title_x + 162, title_y - 1, 6, 6, 0xD8B800);
-        draw_text(&mut buf, "TETRIS", title_x + 18, title_y + 4, 3, NES_TEXT);
+        // Title
+        let title_x = board_x + BOARD_W * cell / 2 - 72;
+        let title_y = board_y.saturating_sub(50).max(2);
+        fill_rect(&mut buf, ww, wh, title_x.saturating_sub(15), title_y.saturating_sub(4), 180, 34, 0x0000A8);
+        draw_rect_outline(&mut buf, ww, wh, title_x.saturating_sub(15), title_y.saturating_sub(4), 180, 34, 0xD8B800);
+        draw_rect_outline(&mut buf, ww, wh, title_x.saturating_sub(13), title_y.saturating_sub(2), 176, 30, 0xA81010);
+        fill_rect(&mut buf, ww, wh, title_x.saturating_sub(18), title_y.saturating_sub(1), 6, 6, 0xD8B800);
+        fill_rect(&mut buf, ww, wh, title_x + 162, title_y.saturating_sub(1), 6, 6, 0xD8B800);
+        draw_text(&mut buf, ww, wh, "TETRIS", title_x + 18, title_y + 4, 3, NES_TEXT);
 
-        // Right-side info panels (all on right of board)
-        // Lines box at top-right area
-        let lp_x = BOARD_X + BOARD_W * CELL + 18;
-        let lp_y = BOARD_Y;
-        // (lines merged into score panel below)
-
-        // Board border (ornamental Russian style)
-        let bx = BOARD_X - 6;
-        let by = BOARD_Y - 6;
-        let bw = BOARD_W * CELL + 12;
-        let bh = BOARD_H * CELL + 12;
-        fill_rect(&mut buf, bx, by, bw, bh, NES_PANEL_BG);
-        draw_rect_outline(&mut buf, bx, by, bw, bh, 0xD8B800);
-        draw_rect_outline(&mut buf, bx + 1, by + 1, bw - 2, bh - 2, 0xA81010);
-        draw_rect_outline(&mut buf, bx + 2, by + 2, bw - 4, bh - 4, NES_BORDER);
-        // Corner ornaments
+        // Board border
+        let bx = board_x.saturating_sub(6);
+        let by = board_y.saturating_sub(6);
+        let bw = BOARD_W * cell + 12;
+        let bh = BOARD_H * cell + 12;
+        fill_rect(&mut buf, ww, wh, bx, by, bw, bh, NES_PANEL_BG);
+        draw_rect_outline(&mut buf, ww, wh, bx, by, bw, bh, 0xD8B800);
+        draw_rect_outline(&mut buf, ww, wh, bx + 1, by + 1, bw - 2, bh - 2, 0xA81010);
+        draw_rect_outline(&mut buf, ww, wh, bx + 2, by + 2, bw - 4, bh - 4, NES_BORDER);
         for &(cx, cy) in &[(bx, by), (bx + bw - 6, by), (bx, by + bh - 6), (bx + bw - 6, by + bh - 6)] {
-            fill_rect(&mut buf, cx, cy, 6, 6, 0xD8B800);
+            fill_rect(&mut buf, ww, wh, cx, cy, 6, 6, 0xD8B800);
         }
 
         // Board field
-        fill_rect(&mut buf, BOARD_X, BOARD_Y, BOARD_W * CELL, BOARD_H * CELL, NES_FIELD_BG);
+        fill_rect(&mut buf, ww, wh, board_x, board_y, BOARD_W * cell, BOARD_H * cell, NES_FIELD_BG);
 
-        // Locked cells (NES style)
+        // Locked cells
         for r in 0..BOARD_H {
             for c in 0..BOARD_W {
                 if let Some(piece_idx) = game.board[r][c] {
-                    draw_nes_block(&mut buf, BOARD_X + c * CELL, BOARD_Y + r * CELL, CELL, piece_idx);
+                    draw_nes_block(&mut buf, ww, wh, board_x + c * cell, board_y + r * cell, cell, piece_idx);
                 }
             }
         }
 
         if !game.game_over {
-            // Ghost piece (subtle)
+            // Ghost piece
             let gr = game.ghost();
             let gc = game.cells(gr, game.col, game.rot);
             let pc = COLORS[game.piece];
+            let ghost_pad = (cell / 12).max(1);
             for (r, c) in gc {
                 if r >= 0 {
                     let ghost_c = blend(NES_FIELD_BG, pc, 30);
-                    fill_rect(&mut buf, (BOARD_X as i32 + c * CELL as i32 + 2) as usize,
-                        (BOARD_Y as i32 + r * CELL as i32 + 2) as usize, CELL-4, CELL-4, ghost_c);
+                    fill_rect(&mut buf, ww, wh,
+                        (board_x as i32 + c * cell as i32 + ghost_pad as i32) as usize,
+                        (board_y as i32 + r * cell as i32 + ghost_pad as i32) as usize,
+                        cell - ghost_pad * 2, cell - ghost_pad * 2, ghost_c);
                 }
             }
 
-            // Current piece (NES style)
+            // Current piece
             for (r, c) in game.cur() {
                 if r >= 0 {
-                    draw_nes_block(&mut buf, (BOARD_X as i32 + c * CELL as i32) as usize,
-                        (BOARD_Y as i32 + r * CELL as i32) as usize, CELL, game.piece);
+                    draw_nes_block(&mut buf, ww, wh,
+                        (board_x as i32 + c * cell as i32) as usize,
+                        (board_y as i32 + r * cell as i32) as usize, cell, game.piece);
                 }
             }
         }
 
-        // Right panel - all info
-        let px = BOARD_X + BOARD_W * CELL + 16;
-        let pw = 170;
+        // Right panel
+        let px = board_x + BOARD_W * cell + 16;
+        let pw = 170.min(ww.saturating_sub(px + 10));
 
         // Score + Lines box
-        let mut py = BOARD_Y;
-        fill_rect(&mut buf, px, py, pw, 68, NES_PANEL_BG);
-        draw_rect_outline(&mut buf, px, py, pw, 68, 0xD8B800);
-        draw_rect_outline(&mut buf, px + 1, py + 1, pw - 2, 66, NES_BORDER);
-        draw_text(&mut buf, "SCORE", px + 8, py + 5, 2, 0xD8B800);
-        draw_text(&mut buf, &format!("{:06}", game.score), px + 8, py + 22, 3, NES_SCORE_COLOR);
-        draw_text(&mut buf, "LINES", px + 8, py + 48, 2, 0xD8B800);
-        draw_text(&mut buf, &format!("{:03}", game.lines), px + 80, py + 48, 2, NES_SCORE_COLOR);
+        let mut py = board_y;
+        fill_rect(&mut buf, ww, wh, px, py, pw, 68, NES_PANEL_BG);
+        draw_rect_outline(&mut buf, ww, wh, px, py, pw, 68, 0xD8B800);
+        draw_rect_outline(&mut buf, ww, wh, px + 1, py + 1, pw.saturating_sub(2), 66, NES_BORDER);
+        draw_text(&mut buf, ww, wh, "SCORE", px + 8, py + 5, 2, 0xD8B800);
+        draw_text(&mut buf, ww, wh, &format!("{:06}", game.score), px + 8, py + 22, 3, NES_SCORE_COLOR);
+        draw_text(&mut buf, ww, wh, "LINES", px + 8, py + 48, 2, 0xD8B800);
+        draw_text(&mut buf, ww, wh, &format!("{:03}", game.lines), px + 80, py + 48, 2, NES_SCORE_COLOR);
 
         // Next box
         py += 78;
-        fill_rect(&mut buf, px, py, pw, 82, NES_PANEL_BG);
-        draw_rect_outline(&mut buf, px, py, pw, 82, 0xD8B800);
-        draw_rect_outline(&mut buf, px + 1, py + 1, pw - 2, 80, NES_BORDER);
-        draw_text(&mut buf, "NEXT", px + 50, py + 5, 2, 0xD8B800);
-        fill_rect(&mut buf, px + 20, py + 20, 130, 1, 0xD8B800);
+        let next_cell = (cell * 5 / 6).max(8);
+        fill_rect(&mut buf, ww, wh, px, py, pw, 82, NES_PANEL_BG);
+        draw_rect_outline(&mut buf, ww, wh, px, py, pw, 82, 0xD8B800);
+        draw_rect_outline(&mut buf, ww, wh, px + 1, py + 1, pw.saturating_sub(2), 80, NES_BORDER);
+        draw_text(&mut buf, ww, wh, "NEXT", px + 50, py + 5, 2, 0xD8B800);
+        fill_rect(&mut buf, ww, wh, px + 20, py + 20, pw.saturating_sub(40), 1, 0xD8B800);
         let no = TETROMINOES[game.next][0];
         for &(dr, dc) in &no {
-            draw_nes_block(&mut buf, px + 45 + dc as usize * 20, py + 28 + dr as usize * 20, 20, game.next);
+            draw_nes_block(&mut buf, ww, wh, px + 45 + dc as usize * next_cell, py + 28 + dr as usize * next_cell, next_cell, game.next);
         }
 
         // Level box
         py += 92;
-        fill_rect(&mut buf, px, py, pw, 42, NES_PANEL_BG);
-        draw_rect_outline(&mut buf, px, py, pw, 42, 0xD8B800);
-        draw_rect_outline(&mut buf, px + 1, py + 1, pw - 2, 40, NES_BORDER);
-        draw_text(&mut buf, "LEVEL", px + 8, py + 5, 2, 0xD8B800);
-        draw_text(&mut buf, &format!("{:02}", game.level), px + 80, py + 5, 3, NES_SCORE_COLOR);
-        draw_text(&mut buf, "TYPE A", px + 8, py + 26, 2, 0x6888FC);
+        fill_rect(&mut buf, ww, wh, px, py, pw, 42, NES_PANEL_BG);
+        draw_rect_outline(&mut buf, ww, wh, px, py, pw, 42, 0xD8B800);
+        draw_rect_outline(&mut buf, ww, wh, px + 1, py + 1, pw.saturating_sub(2), 40, NES_BORDER);
+        draw_text(&mut buf, ww, wh, "LEVEL", px + 8, py + 5, 2, 0xD8B800);
+        draw_text(&mut buf, ww, wh, &format!("{:02}", game.level), px + 80, py + 5, 3, NES_SCORE_COLOR);
+        draw_text(&mut buf, ww, wh, "TYPE A", px + 8, py + 26, 2, 0x6888FC);
 
         // Controls box
         py += 52;
-        fill_rect(&mut buf, px, py, pw, 82, NES_PANEL_BG);
-        draw_rect_outline(&mut buf, px, py, pw, 82, 0xD8B800);
-        draw_rect_outline(&mut buf, px + 1, py + 1, pw - 2, 80, NES_BORDER);
-        draw_text(&mut buf, "CONTROLS", px + 30, py + 5, 2, 0xD8B800);
-        fill_rect(&mut buf, px + 10, py + 4, 4, 4, 0xA81010);
-        fill_rect(&mut buf, px + pw - 14, py + 4, 4, 4, 0xA81010);
-        draw_text(&mut buf, "ARROWS/WASD", px + 8, py + 22, 2, 0x6888FC);
-        draw_text(&mut buf, "SPACE: DROP", px + 8, py + 38, 2, 0x6888FC);
-        draw_text(&mut buf, "R:NEW T:AI", px + 8, py + 54, 2, 0x6888FC);
+        fill_rect(&mut buf, ww, wh, px, py, pw, 82, NES_PANEL_BG);
+        draw_rect_outline(&mut buf, ww, wh, px, py, pw, 82, 0xD8B800);
+        draw_rect_outline(&mut buf, ww, wh, px + 1, py + 1, pw.saturating_sub(2), 80, NES_BORDER);
+        draw_text(&mut buf, ww, wh, "CONTROLS", px + 30, py + 5, 2, 0xD8B800);
+        fill_rect(&mut buf, ww, wh, px + 10, py + 4, 4, 4, 0xA81010);
+        fill_rect(&mut buf, ww, wh, px + pw.saturating_sub(14), py + 4, 4, 4, 0xA81010);
+        draw_text(&mut buf, ww, wh, "ARROWS/WASD", px + 8, py + 22, 2, 0x6888FC);
+        draw_text(&mut buf, ww, wh, "SPACE: DROP", px + 8, py + 38, 2, 0x6888FC);
+        draw_text(&mut buf, ww, wh, "R:NEW T:AI", px + 8, py + 54, 2, 0x6888FC);
         if game.auto_play {
-            draw_text(&mut buf, "AI ON", px + 40, py + 68, 2, 0x00FF88);
+            draw_text(&mut buf, ww, wh, "AI ON", px + 40, py + 68, 2, 0x00FF88);
         }
-
-        //
 
         // Tetris flash effect
         if game.tetris_flash > 0.0 {
             game.tetris_flash -= 1.0 / 60.0;
             let intensity = (game.tetris_flash * 3.0).min(1.0);
-            // White flash over the board area
-            let alpha = (intensity * 180.0) as u32;
-            let flash_color = (alpha << 16) | (alpha << 8) | alpha;
-            for py in BOARD_Y..BOARD_Y + BOARD_H * CELL {
-                for px_i in BOARD_X..BOARD_X + BOARD_W * CELL {
-                    if py < WIN_H && px_i < WIN_W {
-                        let idx = py * WIN_W + px_i;
+            for fpy in board_y..board_y + BOARD_H * cell {
+                for fpx in board_x..board_x + BOARD_W * cell {
+                    if fpy < wh && fpx < ww {
+                        let idx = fpy * ww + fpx;
                         buf[idx] = blend(buf[idx], 0xFFFFFF, (intensity * 120.0) as u32);
                     }
                 }
             }
-            // Rainbow "TETRIS!" text
             let t = (1.0 - game.tetris_flash) * 6.0;
             let rainbow = match (t as u32) % 6 {
                 0 => 0xFF0000, 1 => 0xFF8800, 2 => 0xFFFF00,
                 3 => 0x00FF00, 4 => 0x0088FF, _ => 0xFF00FF,
             };
-            let cx = BOARD_X + (BOARD_W * CELL) / 2;
-            let cy = BOARD_Y + (BOARD_H * CELL) / 2;
-            // Pulsing scale effect
-            let scale = 4;
-            let tw = 7 * 6 * scale; // "TETRIS!" = 7 chars
-            draw_text(&mut buf, "TETRIS!", cx - tw / 2, cy - scale * 4, scale, rainbow);
-            // Side sparkle lines
-            let sparkle_w = (intensity * BOARD_W as f64 * CELL as f64 * 0.5) as usize;
-            let sparkle_y = cy + scale * 5;
+            let cx = board_x + (BOARD_W * cell) / 2;
+            let cy = board_y + (BOARD_H * cell) / 2;
+            let tscale = 4;
+            let tw = 7 * 6 * tscale;
+            draw_text(&mut buf, ww, wh, "TETRIS!", cx - tw / 2, cy - tscale * 4, tscale, rainbow);
+            let sparkle_w = (intensity * BOARD_W as f64 * cell as f64 * 0.5) as usize;
+            let sparkle_y = cy + tscale * 5;
             if sparkle_w > 0 {
-                fill_rect(&mut buf, cx - sparkle_w / 2, sparkle_y, sparkle_w, 3, rainbow);
-                fill_rect(&mut buf, cx - sparkle_w / 2, sparkle_y - 20, sparkle_w, 3, rainbow);
+                fill_rect(&mut buf, ww, wh, cx - sparkle_w / 2, sparkle_y, sparkle_w, 3, rainbow);
+                fill_rect(&mut buf, ww, wh, cx - sparkle_w / 2, sparkle_y.saturating_sub(20), sparkle_w, 3, rainbow);
             }
         }
 
-        // Game over overlay
+        // Game over overlay with high scores
         if game.game_over {
-            let cx = BOARD_X + (BOARD_W * CELL) / 2;
-            let cy = BOARD_Y + (BOARD_H * CELL) / 2;
-            fill_rect(&mut buf, cx - 110, cy - 45, 220, 90, NES_PANEL_BG);
-            draw_rect_outline(&mut buf, cx - 110, cy - 45, 220, 90, NES_BORDER);
-            draw_rect_outline(&mut buf, cx - 109, cy - 44, 218, 88, NES_BORDER);
-            draw_text(&mut buf, "GAME OVER", cx - 80, cy - 28, 3, 0xD82800);
-            draw_text(&mut buf, "PRESS R", cx - 50, cy + 12, 2, NES_TEXT);
+            let cx = board_x + (BOARD_W * cell) / 2;
+            let cy = board_y + (BOARD_H * cell) / 2;
+            let panel_h = 90 + cached_high_scores.len() * 16 + if cached_high_scores.is_empty() { 0 } else { 24 };
+            let top = cy.saturating_sub(panel_h / 2);
+            fill_rect(&mut buf, ww, wh, cx.saturating_sub(110), top, 220, panel_h, NES_PANEL_BG);
+            draw_rect_outline(&mut buf, ww, wh, cx.saturating_sub(110), top, 220, panel_h, NES_BORDER);
+            draw_rect_outline(&mut buf, ww, wh, cx.saturating_sub(109), top + 1, 218, panel_h.saturating_sub(2), NES_BORDER);
+            draw_text(&mut buf, ww, wh, "GAME OVER", cx.saturating_sub(80), top + 10, 3, 0xD82800);
+            draw_text(&mut buf, ww, wh, "PRESS R", cx.saturating_sub(50), top + 40, 2, NES_TEXT);
+
+            if !cached_high_scores.is_empty() {
+                draw_text(&mut buf, ww, wh, "HIGH SCORES", cx.saturating_sub(66), top + 62, 2, 0xD8B800);
+                for (i, hs) in cached_high_scores.iter().enumerate() {
+                    let y = top + 80 + i * 16;
+                    let entry = format!("{}.{:>6} L{:>2}", i + 1, hs.score, hs.level);
+                    let color = if i == 0 { 0xD8B800 } else { NES_TEXT };
+                    draw_text(&mut buf, ww, wh, &entry, cx.saturating_sub(90), y, 2, color);
+                }
+            }
         }
 
-        window.update_with_buffer(&buf, WIN_W, WIN_H).unwrap();
+        window.update_with_buffer(&buf, ww, wh).unwrap();
         prev_keys = keys;
     }
 }
